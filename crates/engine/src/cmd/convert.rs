@@ -86,16 +86,19 @@ fn convert(s: &mut Session, p: &Value) -> Result<Value> {
         match write_dng_for(s, path, packet) {
             Ok(out) => {
                 let file_name = Path::new(&out).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                // the DNG is a new file: its recipe comes from a probe, or is forgotten so the RAF's recipe is not shown for it
+                let probed = (s.media.file_probe.is_some()).then(|| crate::import::probe_paths(s, std::slice::from_ref(&out)).pop()).flatten();
                 // virtual copies of this photo follow it to the DNG
-                for c in s.catalog.photos().filter(|c| c.copy_of == Some(id)) {
+                let copies: Vec<_> = s.catalog.photos().filter(|c| c.copy_of == Some(id)).cloned().collect();
+                for photo in copies.iter().chain(std::iter::once(&ph)) {
                     ops.push(Op::Relink {
-                        id: c.id,
+                        id: photo.id,
                         file_name: file_name.clone(),
                         source: Source::File { path: out.clone() },
                         format: Some("DNG".into()),
                     });
+                    push_recipe_for_new_file(&mut ops, photo, probed.as_ref());
                 }
-                ops.push(Op::Relink { id, file_name, source: Source::File { path: out.clone() }, format: Some("DNG".into()) });
                 converted.push(json!({"id": id.0, "path": out, "original": path}));
             }
             Err(e) => skipped.push(json!([id.0, e])),
@@ -253,6 +256,38 @@ fn fill_missing_meta(id: lightcraft_catalog::PhotoId, ph: &lightcraft_catalog::P
         ops.push(Op::SetCaptured { id, captured: info.captured.clone() });
     }
     ops
+}
+
+/// `SetMeta` that stores the probe's film recipe on `ph`, or nothing when the photo already has it.
+pub(crate) fn fuji_recipe_op(id: lightcraft_catalog::PhotoId, ph: &lightcraft_catalog::Photo, info: &crate::media::ProbeInfo) -> Option<Op> {
+    let mut meta = ph.meta.clone();
+    adopt_fuji_recipe(&mut meta, &ph.content_hash, info).then(|| Op::SetMeta { id, meta: Box::new(meta) })
+}
+
+/// Drop a stored film recipe. The photo now points at a file that was not confirmed to be the same
+/// bytes, and there is no probe of it. The Info panel may read that file. Nothing when the photo
+/// had no recipe and had not been checked.
+pub(crate) fn forget_fuji_recipe_op(ph: &lightcraft_catalog::Photo) -> Option<Op> {
+    if ph.meta.fuji_recipe.is_none() && !ph.meta.fuji_recipe_known {
+        return None;
+    }
+    let mut meta = ph.meta.clone();
+    meta.fuji_recipe = None;
+    meta.fuji_recipe_known = false;
+    Some(Op::SetMeta { id: ph.id, meta: Box::new(meta) })
+}
+
+/// After a relink, keep the probe's recipe when there is one, and otherwise forget the previous
+/// file's recipe so it is not shown for the new file.
+pub(crate) fn push_recipe_for_new_file(
+    ops: &mut Vec<Op>,
+    ph: &lightcraft_catalog::Photo,
+    probed: Option<&std::result::Result<crate::media::ProbeInfo, String>>,
+) {
+    match probed {
+        Some(Ok(info)) => ops.extend(fuji_recipe_op(ph.id, ph, info)),
+        _ => ops.extend(forget_fuji_recipe_op(ph)),
+    }
 }
 
 /// Copy a film recipe learned by a fresh probe onto `meta`. Photos imported before the recipe was

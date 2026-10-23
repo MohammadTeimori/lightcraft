@@ -140,3 +140,58 @@ fn fuji_recipe_does_not_open_a_non_fuji_raw() {
     s.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
     assert!(s.execute("photo.fujiRecipe", &json!({"id": jpeg.0})).is_err(), "an unknown JPEG is still opened");
 }
+
+fn film(value: &str) -> lightcraft_meta::FujiRecipe {
+    lightcraft_meta::FujiRecipe { rows: vec![lightcraft_meta::FujiRow { tag: 0x1401, label: "Film simulation".into(), value: value.into() }] }
+}
+
+fn probe_with(hash: &str, recipe: Option<lightcraft_meta::FujiRecipe>) -> crate::media::FileProbe {
+    let hash = hash.to_string();
+    std::sync::Arc::new(move |_| {
+        Ok(crate::media::ProbeInfo {
+            content_hash: Some(hash.clone()),
+            meta: lightcraft_catalog::Meta { fuji_recipe: recipe.clone(), fuji_recipe_known: true, ..Default::default() },
+            ..Default::default()
+        })
+    })
+}
+
+/// Relink Photo points at a different file. A probe replaces the stored recipe, including with
+/// "this file has none". With no probe the old recipe is dropped so it is not shown for the new file.
+#[test]
+fn relink_replaces_the_stored_recipe_with_the_new_file() {
+    let dir = std::env::temp_dir().join(format!("lc-fuji-relink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("other.jpg");
+    std::fs::write(&file, b"x").unwrap();
+    let path = file.to_string_lossy().to_string();
+
+    let mut s = Session::new();
+    let id = s.catalog.alloc_photo_id();
+    let mut photo = Photo::new(id, Source::File { path: "Z:/old/DSCF0001.JPG".into() }, "DSCF0001.JPG", "JPEG", 100, 100, "2026-10-12");
+    photo.content_hash = Some("old".into());
+    photo.meta.fuji_recipe = Some(film("Classic Chrome"));
+    photo.meta.fuji_recipe_known = true;
+    photo.meta.title = "Mine".into();
+    s.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
+    s.execute("photo.relink", &json!({"id": id.0, "path": path})).unwrap();
+    let ph = s.catalog.photo(id).unwrap();
+    assert!(ph.meta.fuji_recipe.is_none() && !ph.meta.fuji_recipe_known, "no probe: the old recipe is not kept");
+    assert_eq!(ph.meta.title, "Mine");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().meta.fuji_recipe.as_ref().map(|r| r.rows[0].value.as_str()), Some("Classic Chrome"));
+
+    s.media.file_probe = Some(probe_with("new", Some(film("Eterna"))));
+    s.execute("photo.relink", &json!({"id": id.0, "path": path})).unwrap();
+    let ph = s.catalog.photo(id).unwrap();
+    assert_eq!(ph.meta.fuji_recipe.as_ref().map(|r| r.rows[0].value.as_str()), Some("Eterna"));
+    assert!(ph.meta.fuji_recipe_known);
+    assert_eq!(ph.meta.title, "Mine");
+
+    s.media.file_probe = Some(probe_with("newer", None));
+    s.execute("photo.relink", &json!({"id": id.0, "path": path})).unwrap();
+    let ph = s.catalog.photo(id).unwrap();
+    assert!(ph.meta.fuji_recipe.is_none() && ph.meta.fuji_recipe_known, "a probed file with no recipe stays empty");
+    let _ = std::fs::remove_dir_all(&dir);
+}
