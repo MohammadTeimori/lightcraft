@@ -40,11 +40,43 @@ impl FujiRecipe {
     }
 }
 
-/// Recipe in a file. A RAF contributes only its embedded JPEG (the header's offset and length);
-/// a JPEG is read whole. `Ok(None)` when the file has no Fujifilm recipe.
+/// Recipe in a file. A RAF contributes only the EXIF segment of its embedded JPEG, not the preview
+/// and not the sensor data. A JPEG contributes only its EXIF segment. A TIFF, including a DNG, is
+/// read only far enough to reach a Fujifilm MakerNote; a different make stops after a short sniff.
+/// Anything else stops after the header. `Ok(None)` when the file has no Fujifilm recipe. A header
+/// that claims to go on past the cap is also `Ok(None)`: retrying it would read the same bytes again.
 pub fn read_recipe_file(path: &Path) -> Result<Option<FujiRecipe>, String> {
     let bytes = read_for_recipe(path)?;
     Ok(recipe_from_bytes(&bytes))
+}
+
+/// Whether a photo's file can hold a Fujifilm recipe. A known other make is skipped. The camera
+/// string is empty on catalogs from before the make was stored, so JPEG and TIFF names are still
+/// candidates; other raw extensions are not.
+pub fn might_hold_fuji_recipe(camera: &str, format: &str, file_name: &str) -> bool {
+    if kind_is(format, &["raf"]) || kind_is(file_name, &["raf"]) {
+        return true;
+    }
+    if mentions_fuji(camera) {
+        return true;
+    }
+    if !camera.trim().is_empty() {
+        return false;
+    }
+    kind_is(format, &["jpg", "jpeg", "jpe", "tif", "tiff"]) || kind_is(file_name, &["jpg", "jpeg", "jpe", "tif", "tiff"])
+}
+
+fn kind_is(value: &str, opts: &[&str]) -> bool {
+    let bare = value.rsplit(['/', '\\', '.']).next().unwrap_or("");
+    opts.iter().any(|opt| bare.eq_ignore_ascii_case(opt))
+}
+
+fn mentions_fuji(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    if upper.contains("FUJIFILM") || upper.contains("FUJI PHOTO") || upper.contains("FUJI FILM") {
+        return true;
+    }
+    upper.split(|c: char| !c.is_ascii_alphanumeric()).any(|word| word == "FUJI")
 }
 
 /// Recipe in a JPEG, RAF, or TIFF-structured EXIF block already in memory.
@@ -69,32 +101,172 @@ pub fn recipe_from_exif(bytes: &[u8]) -> Option<FujiRecipe> {
     (!recipe.rows.is_empty()).then_some(recipe)
 }
 
+const HEADER_BYTES: usize = 92;
+/// EXIF and the segments before it. One JPEG segment is at most 64 KiB; this stops a run of them.
+const JPEG_META_MAX: usize = 8 * 1024 * 1024;
+const TIFF_SNIFF: usize = 64 * 1024;
+const TIFF_META_MAX: usize = 4 * 1024 * 1024;
+const RAF_JPEG_MAX: u64 = 64 * 1024 * 1024;
+
 fn read_for_recipe(path: &Path) -> Result<Vec<u8>, String> {
     let shown = path.display().to_string();
-    let mut file = File::open(path).map_err(|e| format!("{shown}: {e}"))?;
-    let mut head = [0u8; 92];
+    let file = File::open(path).map_err(|e| format!("{shown}: {e}"))?;
+    recipe_window(file, &shown)
+}
+
+/// The bytes a recipe can live in.
+fn recipe_window<R: Read + Seek>(mut file: R, shown: &str) -> Result<Vec<u8>, String> {
+    let mut head = [0u8; HEADER_BYTES];
     let n = file.read(&mut head).map_err(|e| format!("{shown}: {e}"))?;
-    if head.get(..n.min(15)).is_some_and(|h| h.starts_with(b"FUJIFILMCCD-RAW")) {
-        if n < 92 {
-            return Err(format!("{shown}: truncated RAF header"));
+    let got = head.get(..n).unwrap_or(&[]);
+    if got.starts_with(b"FUJIFILMCCD-RAW") {
+        return raf_embedded_jpeg(&mut file, &head, n, shown);
+    }
+    if n >= 2 && got.first() == Some(&0xff) && got.get(1) == Some(&0xd8) {
+        return jpeg_exif_window(&mut file, got, shown);
+    }
+    if tiff_magic(got) {
+        return tiff_prefix(&mut file, got, shown);
+    }
+    Ok(Vec::new())
+}
+
+fn tiff_magic(head: &[u8]) -> bool {
+    head.starts_with(b"II*\0") || head.starts_with(b"MM\0*")
+}
+
+fn raf_embedded_jpeg<R: Read + Seek>(file: &mut R, head: &[u8], n: usize, shown: &str) -> Result<Vec<u8>, String> {
+    if n < HEADER_BYTES {
+        return Err(format!("{shown}: truncated RAF header"));
+    }
+    let off = u64::from(be_u32(head, 84).ok_or_else(|| format!("{shown}: truncated RAF header"))?);
+    let len = u64::from(be_u32(head, 88).ok_or_else(|| format!("{shown}: truncated RAF header"))?);
+    if off == 0 || len == 0 || len > RAF_JPEG_MAX {
+        return Ok(Vec::new());
+    }
+    file.seek(SeekFrom::Start(off)).map_err(|e| format!("{shown}: {e}"))?;
+    // the length stops the read at the embedded JPEG: bytes after it are the raw image
+    let mut jpeg = file.take(len);
+    let mut jhead = [0u8; HEADER_BYTES];
+    let jn = jpeg.read(&mut jhead).map_err(|e| format!("{shown}: {e}"))?;
+    let Some(got) = jhead.get(..jn) else { return Ok(Vec::new()) };
+    if jn < 2 || got.first() != Some(&0xff) || got.get(1) != Some(&0xd8) {
+        return Ok(Vec::new());
+    }
+    jpeg_exif_window(&mut jpeg, got, shown)
+}
+
+fn be_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    let slice = bytes.get(at..end)?;
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(slice);
+    Some(u32::from_be_bytes(buf))
+}
+
+/// SOI plus the first EXIF APP1 segment plus EOI. Stops at the start of scan. A segment that
+/// would run past [`JPEG_META_MAX`] is treated as no recipe, so the panel does not open the file
+/// again on a timer.
+fn jpeg_exif_window<R: Read>(file: &mut R, head: &[u8], shown: &str) -> Result<Vec<u8>, String> {
+    let mut buf = head.to_vec();
+    let mut i = 2usize;
+    while i < JPEG_META_MAX {
+        let Some(marker_at) = i.checked_add(1) else { break };
+        let need = marker_at.saturating_add(3);
+        fill(file, &mut buf, need, JPEG_META_MAX, shown)?;
+        let Some(marker0) = buf.get(i).copied() else { break };
+        if marker0 != 0xff {
+            break;
         }
-        let off = u32::from_be_bytes([head[84], head[85], head[86], head[87]]) as u64;
-        let len = u32::from_be_bytes([head[88], head[89], head[90], head[91]]) as u64;
-        if off == 0 || len == 0 {
+        let Some(marker) = buf.get(marker_at).copied() else { break };
+        if marker == 0xff {
+            i = marker_at;
+            continue;
+        }
+        // standalone markers: no length (fill bytes, restart, TEM)
+        if marker == 0xd8 || (0xd0..=0xd7).contains(&marker) || marker == 0x01 {
+            i = marker_at.saturating_add(1);
+            continue;
+        }
+        // start of scan, or end of image: the recipe is not in the compressed data
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        let Some(len_at) = marker_at.checked_add(1) else { break };
+        let Some(len_end) = len_at.checked_add(1) else { break };
+        let (Some(hi), Some(lo)) = (buf.get(len_at).copied(), buf.get(len_end).copied()) else { break };
+        let len = usize::from(u16::from_be_bytes([hi, lo]));
+        if len < 2 {
+            break;
+        }
+        let Some(seg_start) = i.checked_add(2) else { break };
+        let Some(end) = seg_start.checked_add(len) else { break };
+        if end > JPEG_META_MAX {
             return Ok(Vec::new());
         }
-        const MAX_JPEG: u64 = 64 * 1024 * 1024;
-        if len > MAX_JPEG {
-            return Err(format!("{shown}: embedded JPEG is too large"));
+        fill(file, &mut buf, end, JPEG_META_MAX, shown)?;
+        if buf.len() < end {
+            break;
         }
-        let len = usize::try_from(len).map_err(|_| format!("{shown}: embedded JPEG is too large"))?;
-        file.seek(SeekFrom::Start(off)).map_err(|e| format!("{shown}: {e}"))?;
-        let mut jpeg = vec![0u8; len];
-        file.read_exact(&mut jpeg).map_err(|e| format!("{shown}: {e}"))?;
-        return Ok(jpeg);
+        let payload = buf.get(seg_start.saturating_add(2)..end).unwrap_or(&[]);
+        if marker == 0xe1 && payload.starts_with(b"Exif\0") {
+            let Some(segment) = buf.get(i..end) else { break };
+            let mut out = Vec::with_capacity(segment.len().saturating_add(4));
+            out.extend_from_slice(&[0xff, 0xd8]);
+            out.extend_from_slice(segment);
+            out.extend_from_slice(&[0xff, 0xd9]);
+            return Ok(out);
+        }
+        i = end;
     }
-    drop(file);
-    std::fs::read(path).map_err(|e| format!("{shown}: {e}"))
+    Ok(Vec::new())
+}
+
+enum TiffMake {
+    Fuji,
+    Other,
+    /// The header parsed, and it has no Make tag in this prefix.
+    Unknown,
+    /// Not a TIFF we can read from this prefix. Reading further does not help.
+    Unreadable,
+}
+
+fn tiff_prefix<R: Read>(file: &mut R, head: &[u8], shown: &str) -> Result<Vec<u8>, String> {
+    let mut buf = head.to_vec();
+    fill(file, &mut buf, TIFF_SNIFF, TIFF_META_MAX, shown)?;
+    if recipe_from_bytes(&buf).is_some() {
+        return Ok(buf);
+    }
+    if matches!(tiff_make(&buf), TiffMake::Other | TiffMake::Unreadable) {
+        return Ok(Vec::new());
+    }
+    fill(file, &mut buf, TIFF_META_MAX, TIFF_META_MAX, shown)?;
+    Ok(buf)
+}
+
+fn tiff_make(bytes: &[u8]) -> TiffMake {
+    let Ok(tiff) = Tiff::parse(bytes) else { return TiffMake::Unreadable };
+    match tiff.ifds.first().and_then(|ifd| ifd.string(0x010f)) {
+        Some(make) if mentions_fuji(&make) => TiffMake::Fuji,
+        Some(_) => TiffMake::Other,
+        None => TiffMake::Unknown,
+    }
+}
+
+fn fill<R: Read>(file: &mut R, buf: &mut Vec<u8>, need: usize, cap: usize, shown: &str) -> Result<(), String> {
+    let need = need.min(cap);
+    while buf.len() < need {
+        let mut tmp = [0u8; 8192];
+        let want = (need - buf.len()).min(tmp.len());
+        let Some(dest) = tmp.get_mut(..want) else { break };
+        let n = file.read(dest).map_err(|e| format!("{shown}: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        let Some(chunk) = dest.get(..n) else { break };
+        buf.extend_from_slice(chunk);
+    }
+    Ok(())
 }
 
 fn decode(ifd: &Ifd) -> FujiRecipe {
@@ -547,5 +719,153 @@ mod tests {
         assert_eq!(from_raf, from_jpeg);
         assert_eq!(value(&from_raf, "Film simulation"), "Classic Chrome");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reader that fails once more than `limit` bytes have been copied out. Seeking does not count:
+    /// a RAF seeks to its embedded JPEG and must not then walk the sensor data.
+    struct Budget {
+        data: Vec<u8>,
+        pos: usize,
+        served: usize,
+        limit: usize,
+    }
+
+    impl Budget {
+        fn new(data: Vec<u8>, limit: usize) -> Self {
+            Self { data, pos: 0, served: 0, limit }
+        }
+    }
+
+    impl Read for Budget {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.data.len() - self.pos);
+            if self.served.saturating_add(n) > self.limit {
+                return Err(std::io::Error::other("read past the recipe window"));
+            }
+            let Some(src) = self.data.get(self.pos..self.pos + n) else {
+                return Ok(0);
+            };
+            let Some(dst) = buf.get_mut(..n) else {
+                return Ok(0);
+            };
+            dst.copy_from_slice(src);
+            self.pos += n;
+            self.served += n;
+            Ok(n)
+        }
+    }
+
+    impl Seek for Budget {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            let len = self.data.len() as u64;
+            let at = self.pos as u64;
+            let next = match pos {
+                SeekFrom::Start(p) => p,
+                SeekFrom::Current(d) if d >= 0 => at.saturating_add(d as u64),
+                SeekFrom::Current(d) => at.checked_sub(d.unsigned_abs()).ok_or_else(|| std::io::Error::other("seek"))?,
+                SeekFrom::End(d) if d >= 0 => len.saturating_add(d as u64),
+                SeekFrom::End(d) => len.checked_sub(d.unsigned_abs()).ok_or_else(|| std::io::Error::other("seek"))?,
+            };
+            if next > len {
+                return Err(std::io::Error::other("seek past end"));
+            }
+            self.pos = next as usize;
+            Ok(next)
+        }
+    }
+
+    #[test]
+    fn candidates_are_raf_jpeg_tiff_or_a_fuji_camera() {
+        assert!(!might_hold_fuji_recipe("", "NEF", "DSC_0001.NEF"));
+        assert!(!might_hold_fuji_recipe("NIKON Z 9", "JPEG", "DSC_0001.JPG"));
+        assert!(might_hold_fuji_recipe("", "JPEG", "DSC_0001.JPG"));
+        assert!(might_hold_fuji_recipe("", "", "DSCF0001.RAF"));
+        assert!(might_hold_fuji_recipe("NIKON Z 9", "RAF", "DSCF0001.RAF"));
+        assert!(might_hold_fuji_recipe("FUJIFILM X-T5", "JPEG", "DSCF0001.JPG"));
+        assert!(might_hold_fuji_recipe("Fuji Photo Film Co., Ltd.", "JPEG", "a.jpg"));
+        assert!(might_hold_fuji_recipe("", "TIF", "DSCF0001.TIF"));
+        assert!(!might_hold_fuji_recipe("", "CR3", "IMG_0001.CR3"));
+        assert!(!might_hold_fuji_recipe("", "DNG", "IMG_0001.DNG"));
+        assert!(might_hold_fuji_recipe("FUJIFILM GFX100", "DNG", "a.dng"));
+        assert!(!might_hold_fuji_recipe("GFX 100", "DNG", "a.dng"), "the model alone is not a make");
+    }
+
+    #[test]
+    fn recipe_reads_do_not_pull_the_rest_of_the_file() {
+        let jpeg = sample_jpeg();
+        let mut jpeg_tail = jpeg.clone();
+        jpeg_tail.extend(std::iter::repeat_n(0x11, 2_000_000));
+        let from_jpeg = recipe_window(Budget::new(jpeg_tail, jpeg.len()), "a.jpg").unwrap();
+        assert!(from_jpeg.len() <= jpeg.len(), "kept {} bytes of the jpeg", from_jpeg.len());
+        assert_eq!(value(&recipe_from_bytes(&from_jpeg).unwrap(), "Film simulation"), "Classic Chrome");
+
+        let raf = sample_raf(2_000_000);
+        let from_raf = recipe_window(Budget::new(raf, HEADER_BYTES + jpeg.len()), "a.raf").unwrap();
+        assert_eq!(value(&recipe_from_bytes(&from_raf).unwrap(), "Film simulation"), "Classic Chrome");
+
+        // the embedded preview is a whole JPEG after the EXIF segment; only the segment is read
+        let mut fat = jpeg.clone();
+        fat.extend(std::iter::repeat_n(0x22, 2_000_000));
+        let mut fat_raf = b"FUJIFILMCCD-RAW ".to_vec();
+        fat_raf.resize(120, 0);
+        fat_raf[84..88].copy_from_slice(&120u32.to_be_bytes());
+        let fat_len = u32::try_from(fat.len()).expect("preview length");
+        fat_raf[88..92].copy_from_slice(&fat_len.to_be_bytes());
+        fat_raf.extend_from_slice(&fat);
+        let from_fat = recipe_window(Budget::new(fat_raf, HEADER_BYTES + jpeg.len()), "fat.raf").unwrap();
+        assert_eq!(value(&recipe_from_bytes(&from_fat).unwrap(), "Film simulation"), "Classic Chrome");
+
+        let mut plain = b"hello".to_vec();
+        plain.resize(2_000_000, 0xab);
+        let from_plain = recipe_window(Budget::new(plain, HEADER_BYTES), "a.nef").unwrap();
+        assert!(from_plain.is_empty(), "a file that is not JPEG, RAF or TIFF stops at the header");
+
+        let mut garbage = b"II*\0canon-raw".to_vec();
+        garbage.resize(2_000_000, 0xab);
+        let from_garbage = recipe_window(Budget::new(garbage, TIFF_SNIFF), "a.nef").unwrap();
+        assert!(from_garbage.is_empty(), "a TIFF header that does not parse is not read to the end");
+
+        let mut note = IfdBuilder::new();
+        note.set(tags::MAKE, Value::Ascii("Canon".into()));
+        let canon = TiffWriter::new(ByteOrder::Little, false).write(&[note]).unwrap();
+        let mut canon_tail = canon;
+        canon_tail.resize(2_000_000, 0xcd);
+        let from_tiff = recipe_window(Budget::new(canon_tail, TIFF_SNIFF), "a.dng").unwrap();
+        assert!(from_tiff.is_empty(), "a Canon TIFF is not loaded past the header sniff");
+
+        let mut fuji = exif_with_note(fuji_note(0x700, [0, 0]));
+        let fuji_len = fuji.len();
+        fuji.resize(fuji_len + 2_000_000, 0xef);
+        let from_fuji_tiff = recipe_window(Budget::new(fuji, TIFF_SNIFF), "a.dng").unwrap();
+        assert!(from_fuji_tiff.len() <= TIFF_SNIFF);
+        assert_eq!(value(&recipe_from_bytes(&from_fuji_tiff).unwrap(), "Film simulation"), "Eterna");
+    }
+
+    #[test]
+    fn a_header_past_the_cap_is_absent_without_reading_the_rest() {
+        let mut jpeg = vec![0xff, 0xd8];
+        let seg = 65535u16;
+        let seg_len = usize::from(seg);
+        while jpeg.len().saturating_add(4).saturating_add(seg_len) <= JPEG_META_MAX {
+            jpeg.extend_from_slice(&[0xff, 0xe0]);
+            jpeg.extend_from_slice(&seg.to_be_bytes());
+            jpeg.extend(std::iter::repeat_n(0, seg_len - 2));
+        }
+        jpeg.extend_from_slice(&[0xff, 0xe0]);
+        jpeg.extend_from_slice(&seg.to_be_bytes());
+        jpeg.extend(std::iter::repeat_n(0, seg_len - 2));
+        let window = recipe_window(Budget::new(jpeg, JPEG_META_MAX.saturating_add(64)), "big.jpg").unwrap();
+        assert!(window.is_empty());
+
+        let mut raf = b"FUJIFILMCCD-RAW ".to_vec();
+        raf.resize(HEADER_BYTES, 0);
+        raf[84..88].copy_from_slice(&92u32.to_be_bytes());
+        let too_big = u32::try_from(RAF_JPEG_MAX + 1).expect("cap fits in u32");
+        raf[88..92].copy_from_slice(&too_big.to_be_bytes());
+        let from_raf = recipe_window(Budget::new(raf, HEADER_BYTES), "big.raf").unwrap();
+        assert!(from_raf.is_empty());
     }
 }

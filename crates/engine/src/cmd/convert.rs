@@ -244,6 +244,7 @@ fn fill_missing_meta(id: lightcraft_catalog::PhotoId, ph: &lightcraft_catalog::P
     if m.focus.is_none() {
         m.focus = src.focus.clone();
     }
+    adopt_fuji_recipe(&mut m, &ph.content_hash, info);
     let mut ops = Vec::new();
     if m != before {
         ops.push(Op::SetMeta { id, meta: Box::new(m) });
@@ -252,6 +253,22 @@ fn fill_missing_meta(id: lightcraft_catalog::PhotoId, ph: &lightcraft_catalog::P
         ops.push(Op::SetCaptured { id, captured: info.captured.clone() });
     }
     ops
+}
+
+/// Copy a film recipe learned by a fresh probe onto `meta`. Photos imported before the recipe was
+/// stored get it here. A file whose bytes changed (a different content hash) is read again, so a
+/// replaced original does not keep the previous camera's recipe. Returns whether `meta` changed.
+fn adopt_fuji_recipe(meta: &mut lightcraft_catalog::Meta, had_hash: &Option<String>, info: &crate::media::ProbeInfo) -> bool {
+    let replaced = info.content_hash.is_some() && had_hash != &info.content_hash;
+    if (meta.fuji_recipe_known && !replaced) || !info.meta.fuji_recipe_known {
+        return false;
+    }
+    if meta.fuji_recipe == info.meta.fuji_recipe && meta.fuji_recipe_known {
+        return false;
+    }
+    meta.fuji_recipe.clone_from(&info.meta.fuji_recipe);
+    meta.fuji_recipe_known = true;
+    true
 }
 
 /// Ops that give a photo the lens data its file carries now (`info`, a fresh probe), or none when
@@ -303,8 +320,10 @@ pub(crate) fn reload_ops(
     }
     // virtual copies share the file
     for c in cat.photos().filter(|c| c.copy_of == Some(id)) {
+        let mut copy_meta = c.meta.clone();
+        let recipe = adopt_fuji_recipe(&mut copy_meta, &c.content_hash, info).then(|| Op::SetMeta { id: c.id, meta: Box::new(copy_meta) });
         let theirs: Vec<Op> =
-            content_op(c.id, c, info.clone()).into_iter().chain(lens_ops(c.id, c, info)).chain(as_shot_wb_op(c.id, c, info)).collect();
+            content_op(c.id, c, info.clone()).into_iter().chain(recipe).chain(lens_ops(c.id, c, info)).chain(as_shot_wb_op(c.id, c, info)).collect();
         if !theirs.is_empty() {
             ops.extend(theirs);
             changed.push(c.id);
@@ -443,6 +462,59 @@ mod tests {
         ph.meta = (**meta).clone();
         ph.captured = Some("2026-10-04T08:16:11".into());
         assert!(fill_missing_meta(PhotoId(1), &ph, &info).is_empty());
+    }
+
+    fn eterna() -> lightcraft_meta::FujiRecipe {
+        lightcraft_meta::FujiRecipe { rows: vec![lightcraft_meta::FujiRow { tag: 0x1401, label: "Film simulation".into(), value: "Eterna".into() }] }
+    }
+
+    /// Reload stores a recipe the file already had when the photo was imported before recipes were
+    /// kept, and replaces it when a different file is now at that path. A virtual copy shares the file.
+    #[test]
+    fn reload_adopts_a_fuji_recipe_and_refreshes_it_when_the_file_changes() {
+        let mut ph = Photo::new(PhotoId(1), Source::File { path: "/a.jpg".into() }, "a.jpg", "JPEG", 100, 80, "2026-10-12T00:00:00");
+        ph.meta.title = "Mine".into();
+        ph.content_hash = Some("old".into());
+        let mut info = crate::media::ProbeInfo { content_hash: Some("old".into()), ..Default::default() };
+        info.meta.fuji_recipe_known = true;
+        info.meta.fuji_recipe = Some(eterna());
+        let ops = fill_missing_meta(PhotoId(1), &ph, &info);
+        let Some(Op::SetMeta { meta, .. }) = ops.first() else { panic!("{ops:?}") };
+        assert_eq!(meta.title, "Mine");
+        assert!(meta.fuji_recipe_known);
+        assert_eq!(meta.fuji_recipe.as_ref().map(|r| r.rows[0].value.as_str()), Some("Eterna"));
+        ph.meta = (**meta).clone();
+        assert!(fill_missing_meta(PhotoId(1), &ph, &info).is_empty(), "the same file is not written again");
+
+        info.content_hash = Some("new".into());
+        info.meta.fuji_recipe = None;
+        let ops = fill_missing_meta(PhotoId(1), &ph, &info);
+        let Some(Op::SetMeta { meta, .. }) = ops.first() else { panic!("{ops:?}") };
+        assert!(meta.fuji_recipe_known && meta.fuji_recipe.is_none(), "a replaced file drops the old recipe");
+
+        let mut cat = lightcraft_catalog::Catalog::new();
+        let id = cat.alloc_photo_id();
+        let original = Photo::new(id, Source::File { path: "/a.jpg".into() }, "a.jpg", "JPEG", 100, 80, "t");
+        cat.apply(Op::AddPhoto { photo: Box::new(original.clone()) }).unwrap();
+        let cid = cat.alloc_photo_id();
+        let mut copy = original.clone();
+        copy.id = cid;
+        copy.copy_of = Some(id);
+        copy.copy_name = Some("Copy 1".into());
+        cat.apply(Op::AddPhoto { photo: Box::new(copy) }).unwrap();
+        info.meta.fuji_recipe = Some(eterna());
+        info.content_hash = Some("old".into());
+        let mut ops = Vec::new();
+        let mut changed = Vec::new();
+        reload_ops(&cat, id, &info, &mut ops, &mut changed);
+        let recipes: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::SetMeta { id, meta } if meta.fuji_recipe.is_some() => Some(id.0),
+                _ => None,
+            })
+            .collect();
+        assert!(recipes.contains(&id.0) && recipes.contains(&cid.0), "{ops:?}");
     }
 
     /// Reload from Disk gives a photo imported before focus points were read its camera focus point,

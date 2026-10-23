@@ -108,3 +108,35 @@ fn fuji_recipe_reads_a_raf_without_importing_the_sensor() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn fuji_recipe_uses_the_stored_note_without_the_file() {
+    let mut s = Session::new();
+    let id = s.catalog.alloc_photo_id();
+    let mut photo = Photo::new(id, Source::File { path: "Z:/missing/no-such.raf".into() }, "no-such.raf", "RAF", 100, 100, "2026-10-12");
+    photo.meta.camera = "FUJIFILM X-T5".into();
+    photo.meta.fuji_recipe_known = true;
+    photo.meta.fuji_recipe = Some(lightcraft_meta::FujiRecipe {
+        rows: vec![lightcraft_meta::FujiRow { tag: 0x1401, label: "Film simulation".into(), value: "Eterna".into() }],
+    });
+    s.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
+    let r = s.execute("photo.fujiRecipe", &json!({"id": id.0})).unwrap();
+    assert_eq!(r["present"], true, "{r}");
+    assert_eq!(r["text"].as_str().unwrap().lines().next(), Some("Film simulation: Eterna"));
+}
+
+#[test]
+fn fuji_recipe_does_not_open_a_non_fuji_raw() {
+    let mut s = Session::new();
+    let id = s.catalog.alloc_photo_id();
+    let mut photo = Photo::new(id, Source::File { path: "Z:/missing/DSC_0001.NEF".into() }, "DSC_0001.NEF", "NEF", 100, 100, "2026-10-12");
+    photo.meta.camera = "NIKON Z 9".into();
+    s.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
+    let r = s.execute("photo.fujiRecipe", &json!({"id": id.0})).expect("a Nikon raw is not read");
+    assert_eq!(r["present"], false, "{r}");
+
+    let jpeg = s.catalog.alloc_photo_id();
+    let photo = Photo::new(jpeg, Source::File { path: "Z:/missing/DSCF0001.JPG".into() }, "DSCF0001.JPG", "JPEG", 100, 100, "2026-10-12");
+    s.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
+    assert!(s.execute("photo.fujiRecipe", &json!({"id": jpeg.0})).is_err(), "an unknown JPEG is still opened");
+}
